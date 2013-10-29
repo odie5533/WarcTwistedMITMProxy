@@ -8,51 +8,70 @@ from twisted.web._newclient import HTTPParser, ParseError, Request, \
 from twisted.web.client import _URI
 
 class ProxyProtocol(protocol.Protocol):
+    """
+    Takes in a function and calls that function with data whenever dataReceived
+    is called
+    """
     def __init__(self, forward):
-        self.forward = forward
-        
-    def dataReceived(self, data):
-        print "ProxyProtocol dataReceived:", len(data)
-        self.forward(data)
+        self.dataReceived = forward
 
 class WebProxyClientProtocol(HTTPClientParser):
-    buffer = None
     serverProtocol = None
-
-    def connectionLost(self, reason):
-        print "Connection lost"
-        if self.serverProtocol is not None:
-            self.serverProtocol.transport.loseConnection()
-            self.serverProtocol = None
-
-    def connectionMade(self):
-        self.proxyBodyProtocol = ProxyProtocol(self._forwardDataReceived)
-        self.serverProtocol._resume(self)
-        HTTPClientParser.connectionMade(self)
-        
-    def _forwardDataReceived(self, data):
+    
+    def _forwardData(self, data):
         """ Takes raw data and forwards it right to the serverProtocol """
         self.serverProtocol.transport.write(data)
     
     def lineReceived(self, line):
+        """ Forwards the headers """
         orig_line = line
         
         if line[-1:] == '\r':
             line = line[:-1]
-        self._forwardDataReceived(line + '\r\n')
+        self._forwardData(line + '\r\n')
         
         HTTPClientParser.lineReceived(self, orig_line)
         
     def allHeadersReceived(self):
         print "WebProxyClientProtocol",self.headers
         HTTPClientParser.allHeadersReceived(self)
+        self.proxyBodyProtocol = ProxyProtocol(self._forwardData)
         self.response.deliverBody(self.proxyBodyProtocol)
         
 class HTTP11WebProxyClientProtocol(protocol.Protocol):
-    def newParser(self):
-        self._parser = WebProxyClientProtocol(self.request, self.finished)
+    """ HTTP11 creates new parsers as they are needed over the HTTP1.1 stream"""
+    # TOFIX: HTTP11WebProxyClientProtocol needs to receive new Requests
+    # as they are produced.
+    def __init__(self, request, serverProtocol):
+        self.request = request
+        self.serverProtocol = serverProtocol
+        
+    def connectionMade(self):
+        self.newRequest(self.request)
+        self.serverProtocol._resume(self)
+        
+    def connectionLost(self, reason):
+        print "Connection lost"
+        if self.serverProtocol is not None:
+            self.serverProtocol.transport.loseConnection()
+            self.serverProtocol = None
+    
+    def newRequest(self, request):
+        self._parser = WebProxyClientProtocol(request, self.finished)
+        self._parser.serverProtocol = self.serverProtocol
+        self._parser.makeConnection(self.transport)
+        
+    def dataReceived(self, data):
+        self._parser.dataReceived(data)
+        
+    def _disconnectParser(self, reason):
+        parser = self._parser
+        self._parser = None
+        parser.connectionLost(reason)
+    
     def finished(self, rest):
-        print "WebProxyClientFactory finished:",rest
+        print "WebProxyClientFactory finished:",len(rest)
+        self._disconnectParser(None)
 
 class WebProxyClientFactory(protocol.ClientFactory):
     def __init__(self, serverProtocol, request):
@@ -60,10 +79,7 @@ class WebProxyClientFactory(protocol.ClientFactory):
         self.request = request
 
     def buildProtocol(self, addr):
-        # 2nd param is the finishResponse function:
-        prot = WebProxyClientProtocol(self.request, lambda _: None)
-        prot.serverProtocol = self.serverProtocol
-        return prot
+        return HTTP11WebProxyClientProtocol(self.request, self.serverProtocol)
 
     def clientConnectionFailed(self, connector, reason):
         self.serverProtocol.transport.loseConnection()
