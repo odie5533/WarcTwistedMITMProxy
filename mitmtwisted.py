@@ -7,6 +7,14 @@ from twisted.web._newclient import HTTPParser, ParseError, Request, \
     HTTPClientParser
 from twisted.web.client import _URI
 
+class ProxyProtocol(protocol.Protocol):
+    def __init__(self, forward):
+        self.forward = forward
+        
+    def dataReceived(self, data):
+        print "ProxyProtocol dataReceived:", len(data)
+        self.forward(data)
+
 class WebProxyClientProtocol(HTTPClientParser):
     buffer = None
     serverProtocol = None
@@ -18,23 +26,33 @@ class WebProxyClientProtocol(HTTPClientParser):
             self.serverProtocol = None
 
     def connectionMade(self):
-        HTTPClientParser.connectionMade(self)
+        self.proxyBodyProtocol = ProxyProtocol(self._forwardDataReceived)
         self.serverProtocol._resume(self)
-    
-    def dataReceived(self, data):
-        """ Response data from the server is provided here """
-        print "WebProxyClientProtocol dataReceived:", len(data)
-        self.serverProtocol.transport.write(data)
-        HTTPClientParser.dataReceived(self, data)
+        HTTPClientParser.connectionMade(self)
         
-    def rawDataReceived(self, data):
-        print "WebProxyClientProtocol rawDataReceived:", len(data)
+    def _forwardDataReceived(self, data):
+        """ Takes raw data and forwards it right to the serverProtocol """
+        self.serverProtocol.transport.write(data)
+    
+    def lineReceived(self, line):
+        orig_line = line
+        
+        if line[-1:] == '\r':
+            line = line[:-1]
+        self._forwardDataReceived(line + '\r\n')
+        
+        HTTPClientParser.lineReceived(self, orig_line)
         
     def allHeadersReceived(self):
         print "WebProxyClientProtocol",self.headers
-        # TOFIX: Need to supply a transferEncoder object, otherwise it pauses
-        # the transport
         HTTPClientParser.allHeadersReceived(self)
+        self.response.deliverBody(self.proxyBodyProtocol)
+        
+class HTTP11WebProxyClientProtocol(protocol.Protocol):
+    def newParser(self):
+        self._parser = WebProxyClientProtocol(self.request, self.finished)
+    def finished(self, rest):
+        print "WebProxyClientFactory finished:",rest
 
 class WebProxyClientFactory(protocol.ClientFactory):
     def __init__(self, serverProtocol, request):
@@ -42,6 +60,7 @@ class WebProxyClientFactory(protocol.ClientFactory):
         self.request = request
 
     def buildProtocol(self, addr):
+        # 2nd param is the finishResponse function:
         prot = WebProxyClientProtocol(self.request, lambda _: None)
         prot.serverProtocol = self.serverProtocol
         return prot
