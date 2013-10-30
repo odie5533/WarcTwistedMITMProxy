@@ -39,14 +39,10 @@ class WebProxyClientProtocol(HTTPClientParser):
         
 class HTTP11WebProxyClientProtocol(protocol.Protocol):
     """ HTTP11 creates new parsers as they are needed over the HTTP1.1 stream"""
-    # TOFIX: HTTP11WebProxyClientProtocol needs to receive new Requests
-    # as they are produced.
-    def __init__(self, request, serverProtocol):
-        self.request = request
+    def __init__(self, serverProtocol):
         self.serverProtocol = serverProtocol
         
     def connectionMade(self):
-        self.newRequest(self.request)
         self.serverProtocol._resume(self)
         
     def connectionLost(self, reason):
@@ -76,12 +72,11 @@ class HTTP11WebProxyClientProtocol(protocol.Protocol):
         self._disconnectParser(None)
 
 class WebProxyClientFactory(protocol.ClientFactory):
-    def __init__(self, serverProtocol, request):
+    def __init__(self, serverProtocol):
         self.serverProtocol = serverProtocol
-        self.request = request
 
     def buildProtocol(self, addr):
-        return HTTP11WebProxyClientProtocol(self.request, self.serverProtocol)
+        return HTTP11WebProxyClientProtocol(self.serverProtocol)
 
     def clientConnectionFailed(self, connector, reason):
         self.serverProtocol.transport.loseConnection()
@@ -125,7 +120,7 @@ class HTTPServerParser(HTTPParser):
         self.requestParsed(
                          self.requestFromHTTPHeaders(self.status, self.headers))
         
-        method, request_uri, _ = parts
+        method, _, _ = parts
         if method == 'GET':
             self.contentLength = 0
             self._finished(self.clearLineBuffer())
@@ -236,19 +231,19 @@ class WebProxyProtocol(HTTPParser):
         method, request_uri, _ = self.parseHttpStatus(self.status)
         
         self.useSSL = method == 'CONNECT'
-        request = HTTPServerParser.requestFromHTTPHeaders(self.status,
-                                                          self.headers)
-        factory = WebProxyClientFactory(self, request)
         print "New connection"
         if self.useSSL:
             host, port = self.parseHostPort(request_uri, 443)
             ccf = ssl.ClientContextFactory()
-            reactor.connectSSL(host, port, factory, ccf)
+            reactor.connectSSL(host, port, WebProxyClientFactory(self), ccf)
         else:
-            # FIX: Should also check for host in the headers and not just the
-            # status line
-            uri = _URI.fromBytes(request_uri)
-            reactor.connectTCP(uri.host, uri.port, factory)
+            if request_uri[:4].lower() == 'http':
+                uri = _URI.fromBytes(request_uri)
+            else:
+                # TOFIX: Should check for host in the headers and not just
+                # the status line
+                raise ParseError('Status line did not contain an absolute uri!')
+            reactor.connectTCP(uri.host, uri.port, WebProxyClientFactory(self))
         HTTPParser.allHeadersReceived(self) # self.switchToBodyMode(None)
         
     def _resume(self, clientProtocol):
