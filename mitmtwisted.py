@@ -15,7 +15,7 @@ class ProxyProtocol(protocol.Protocol):
     def __init__(self, forward):
         self.dataReceived = forward
 
-class WebProxyClientProtocol(HTTPClientParser):
+class WebProxyHTTPClientParser(HTTPClientParser):
     serverProtocol = None
     
     def _forwardData(self, data):
@@ -48,7 +48,10 @@ class HTTP11WebProxyClientProtocol(protocol.Protocol):
             self.serverProtocol = None
     
     def newRequest(self, request):
-        self._parser = WebProxyClientProtocol(request, self.finished)
+        """
+        Creates a new WebProxyHTTPClientParser parser with the given request
+        """
+        self._parser = WebProxyHTTPClientParser(request, self.finished)
         self._parser.serverProtocol = self.serverProtocol
         self._parser.makeConnection(self.transport)
         
@@ -75,7 +78,8 @@ class WebProxyClientFactory(protocol.ClientFactory):
         return HTTP11WebProxyClientProtocol(self.serverProtocol)
 
     def clientConnectionFailed(self, connector, reason):
-        self.serverProtocol.transport.loseConnection()
+        if self.serverProtocol is not None:
+            self.serverProtocol.transport.loseConnection()
 
 class HTTPServerParser(HTTPParser):
     @staticmethod
@@ -101,20 +105,17 @@ class HTTPServerParser(HTTPParser):
             raise ParseError("wrong number of parts", self.status)
         method, request_uri, _ = parts
         
-        self.requestParsed(Request(method, request_uri, self.headers, None,
-                          persistent=True))
-        
         if method == 'GET':
             self.contentLength = 0
-            self._finished(self.clearLineBuffer())
         else:
             self.contentLength = self.parseContentLength(self.connHeaders)
-            if self.contentLength == 0:
-                self._finished(self.clearLineBuffer())
             print "HTTPServerParser Header's Content length", self.contentLength
             # TOFIX: need to include a bodyProducer with the request
             # so that it knows to set a content-length
             self.switchToBodyMode(None)
+        self.requestParsed(Request(method, request_uri, self.headers, None))
+        if self.contentLength == 0:
+            self._finished(self.clearLineBuffer())
             
     def _finished(self, rest):
         """ Called when the entire HTTP request + body is finished """
@@ -183,9 +184,20 @@ class WebProxyProtocol(HTTPParser):
         
     def requestParsed(self, request):
         """ Called after self.httpServerPareser parses a Request """
-        print "  Request headers:", request.headers
+        #print "  Request uri:",request.uri
         # Wikipedia does not accept absolute URIs:
         request.uri = self.convertUriToRelative(request.uri)
+        request.persistent = True
+        proxyConn = self._serverParser.connHeaders.getRawHeaders('proxy-connection')
+        if proxyConn and proxyConn[0].lower() == 'close':
+            request.persistent = False
+        plainConn = self._serverParser.connHeaders.getRawHeaders('connection')
+        if plainConn and plainConn[0].lower() == 'close':
+            request.persistent = False
+        # HACK!!! Force close a connection if there is POST data because
+        # I haven't implemented anything to check the length of the POST data
+        if self._serverParser.contentLength != 0:
+            request.persistent = False
         self.clientProtocol.newRequest(request)
         request.writeTo(self.clientProtocol.transport)
     
