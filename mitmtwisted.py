@@ -35,8 +35,7 @@ class WebProxyClientProtocol(HTTPClientParser):
     def allHeadersReceived(self):
         print "WebProxyClientProtocol",self.headers
         HTTPClientParser.allHeadersReceived(self)
-        self.proxyBodyProtocol = ProxyProtocol(self._forwardData)
-        self.response.deliverBody(self.proxyBodyProtocol)
+        self.response.deliverBody(ProxyProtocol(self._forwardData))
         
 class HTTP11WebProxyClientProtocol(protocol.Protocol):
     """ HTTP11 creates new parsers as they are needed over the HTTP1.1 stream"""
@@ -62,9 +61,12 @@ class HTTP11WebProxyClientProtocol(protocol.Protocol):
         self._parser.makeConnection(self.transport)
         
     def dataReceived(self, data):
+        if self._parser is None:
+            print "HTTP11WebProxyClientProtocol has no _parser. Please issue a newRequest"
         self._parser.dataReceived(data)
         
     def _disconnectParser(self, reason):
+        print "_disconnectParser"
         parser = self._parser
         self._parser = None
         parser.connectionLost(reason)
@@ -110,6 +112,9 @@ class HTTPServerParser(HTTPParser):
         relative_uri = HTTPServerParser.convertUriToRelative(parts[1])
         return Request(parts[0], relative_uri, headers, None, persistent=True)
     
+    def __init__(self, finisher):
+        self.finisher = finisher
+    
     def statusReceived(self, status):
         self.status = status
         
@@ -117,17 +122,27 @@ class HTTPServerParser(HTTPParser):
         parts = self.status.split(' ', 2)
         if len(parts) != 3:
             raise ParseError("wrong number of parts", self.status)
+        self.requestParsed(
+                         self.requestFromHTTPHeaders(self.status, self.headers))
+        
         method, request_uri, _ = parts
-        if method != 'GET':
+        if method == 'GET':
+            self.contentLength = 0
+            self._finished(self.clearLineBuffer())
+        else:
             self.contentLength = self.parseContentLength(self.connHeaders)
             if self.contentLength == 0:
                 self._finished(self.clearLineBuffer())
             print "HTTPServerParser Header's Content length", self.contentLength
-        # TOFIX: need to include a bodyProducer with the request
-        # so that it knows to set a content-length
-        self.requestParsed(
-                         self.requestFromHTTPHeaders(self.status, self.headers))
-        self.switchToBodyMode(None)
+            # TOFIX: need to include a bodyProducer with the request
+            # so that it knows to set a content-length
+            self.switchToBodyMode(None)
+            
+    def _finished(self, rest):
+        """ Called when the entire HTTP request + body is finished """
+        print "HTTPServerParser _finished:", len(rest)
+        assert len(rest) == 0
+        self.finisher(rest)
     
     def rawDataReceived(self, data):
         # TOFIX: use self.bodyDecoder to let HTTPParser handle the data INSTEAD
@@ -142,10 +157,6 @@ class HTTPServerParser(HTTPParser):
     
     def bodyDataReceived(self, data):
         """ Called when bodyData is received """
-        pass
-    
-    def _finished(self):
-        """ Called when the entire HTTP request is finished """
         pass
 
 class WebProxyProtocol(HTTPParser):
@@ -177,37 +188,43 @@ class WebProxyProtocol(HTTPParser):
         self.useSSL = False
         self.clientProtocol = None
         self._rawDataBuffer = ''
+        self._serverParser = None
 
     def statusReceived(self, status):
         self.status = status
 
     def rawDataReceived(self, data):
         """ Receives raw data from the proxied browser """
-        print "WebProxy rawDataReceived:", len(data), ":"
-        if self._serverParser:
+        print "WebProxyProtocol rawDataReceived:", len(data), ":"
+        if self._serverParser is not None:
             self._serverParser.dataReceived(data)
         else:
             # _rawDataBuffer is relayed when _resume() is called
             self._rawDataBuffer += data
-
-    def _finished(self, rest):
-        pass
     
     def writeToClientProtocol(self, data):
         """ Called after self._serverParser receives rawData """
-        print "WebProxy writeToClientProtocol:", len(data)
+        print "WebProxyProtocol writeToClientProtocol:", len(data)
         self.clientProtocol.transport.write(data)
         
     def requestParsed(self, request):
         """ Called after self.httpServerPareser parses a Request """
         print "WebProxyProtocol requestParsed"
+        self.clientProtocol.newRequest(request)
         request.writeTo(self.clientProtocol.transport)
     
     def createHttpServerParser(self):
-        self._serverParser = self.serverParser()
+        if self._serverParser is not None:
+            self._serverParser.connectionLost(None)
+            self._serverParser = None
+        self._serverParser = self.serverParser(self.serverParserFinished)
         self._serverParser.bodyDataReceived = self.writeToClientProtocol
         self._serverParser.requestParsed = self.requestParsed
         self._serverParser.connectionMade() # initializes instance vars
+        
+    def serverParserFinished(self, rest):
+        print "serverParserFinished:",len(rest)
+        self.createHttpServerParser()
         
     def allHeadersReceived(self):
         """
@@ -233,7 +250,7 @@ class WebProxyProtocol(HTTPParser):
             uri = _URI.fromBytes(request_uri)
             reactor.connectTCP(uri.host, uri.port, factory)
         HTTPParser.allHeadersReceived(self) # self.switchToBodyMode(None)
-    
+        
     def _resume(self, clientProtocol):
         """
         Called when a connection to the remote server is established.
