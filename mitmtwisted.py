@@ -1,11 +1,102 @@
 # Copyright (c) David Bern
 
+# TOFIX: Handle Request bodies properly
+
 import argparse
 
 from twisted.internet import ssl, reactor, protocol
 from twisted.web._newclient import HTTPParser, ParseError, Request, \
     HTTPClientParser
 from twisted.web.client import _URI
+
+from twisted.web.http import _DataLoss
+class _RawChunkedTransferDecoder(object):
+    """
+    This class is modified from t.w.http._ChunkedTransferDecoder
+    Rather than only returning the body chunks, this returns raw chunks
+    but makes sure it stops at the end of the body.
+    """
+    state = 'CHUNK_LENGTH'
+
+    def __init__(self, dataCallback, finishCallback):
+        self.dataCallback = dataCallback
+        self.finishCallback = finishCallback
+        self._buffer = ''
+        
+    def _rawData(self, data):
+        self.dataCallback(data)
+
+    def _dataReceived_CHUNK_LENGTH(self, data):
+        if '\r\n' in data:
+            line, rest = data.split('\r\n', 1)
+            self._rawData(line+'\r\n')
+            parts = line.split(';')
+            self.length = int(parts[0], 16)
+            if self.length == 0:
+                self.state = 'TRAILER'
+            else:
+                self.state = 'BODY'
+            return rest
+        else:
+            self._buffer = data
+            return ''
+
+    def _dataReceived_CRLF(self, data):
+        if data.startswith('\r\n'):
+            self.state = 'CHUNK_LENGTH'
+            self._rawData('\r\n')
+            return data[2:]
+        else:
+            self._buffer = data
+            return ''
+
+    def _dataReceived_TRAILER(self, data):
+        if data.startswith('\r\n'):
+            self._rawData('\r\n')
+            data = data[2:]
+            self.state = 'FINISHED'
+            self.finishCallback(data)
+        else:
+            self._buffer = data
+        return ''
+
+    def _dataReceived_BODY(self, data):
+        if len(data) >= self.length:
+            chunk, data = data[:self.length], data[self.length:]
+            self._rawData(chunk)
+            self.state = 'CRLF'
+            return data
+        elif len(data) < self.length:
+            self.length -= len(data)
+            self._rawData(data)
+            return ''
+
+    def _dataReceived_FINISHED(self, data):
+        raise RuntimeError(
+            "_ChunkedTransferDecoder.dataReceived called after last "
+            "chunk was processed")
+
+
+    def dataReceived(self, data):
+        """
+        Interpret data from a request or response body which uses the
+        I{chunked} Transfer-Encoding.
+        """
+        data = self._buffer + data
+        self._buffer = ''
+        while data:
+            data = getattr(self, '_dataReceived_%s' % (self.state,))(data)
+
+
+    def noMoreData(self):
+        """
+        Verify that all data has been received.  If it has not been, raise
+        L{_DataLoss}.
+        """
+        if self.state != 'FINISHED':
+            raise _DataLoss(
+                "Chunked decoder in %r state, still expecting more data to "
+                "get to 'FINISHED' state." % (self.state,))
 
 class ProxyProtocol(protocol.Protocol):
     """
@@ -16,6 +107,9 @@ class ProxyProtocol(protocol.Protocol):
         self.dataReceived = forward
 
 class WebProxyHTTPClientParser(HTTPClientParser):
+    _transferDecoders = {
+        'chunked': _RawChunkedTransferDecoder, # Use our Raw decoder
+    }
     serverProtocol = None
     
     def _forwardData(self, data):
@@ -23,10 +117,10 @@ class WebProxyHTTPClientParser(HTTPClientParser):
         self.serverProtocol.transport.write(data)
     
     def lineReceived(self, line):
-        """ Forwards the headers """
+        """ Forwards the headers exactly as they arrive """
         if line[-1:] == '\r':
             line = line[:-1]
-        self._forwardData(line + '\r\n')        
+        self._forwardData(line + '\r\n') 
         HTTPClientParser.lineReceived(self, line)
         
     def allHeadersReceived(self):
@@ -37,6 +131,7 @@ class HTTP11WebProxyClientProtocol(protocol.Protocol):
     """ HTTP11 creates new parsers as they are needed over the HTTP1.1 stream"""
     def __init__(self, serverProtocol):
         self.serverProtocol = serverProtocol
+        self._buffer = ''
         
     def connectionMade(self):
         self.serverProtocol._resume(self)
@@ -54,11 +149,15 @@ class HTTP11WebProxyClientProtocol(protocol.Protocol):
         self._parser = WebProxyHTTPClientParser(request, self.finished)
         self._parser.serverProtocol = self.serverProtocol
         self._parser.makeConnection(self.transport)
+        if self._buffer:
+            self._parser.dataReceived(self._buffer)
+            self._buffer = ''            
         
     def dataReceived(self, data):
         if self._parser is None:
-            raise ParseError("HTTP11WebProxyClientProtocol has no _parser. Please issue a newRequest")
-        self._parser.dataReceived(data)
+            self._buffer += data
+        else:
+            self._parser.dataReceived(data)
         
     def _disconnectParser(self, reason):
         parser = self._parser
@@ -66,8 +165,9 @@ class HTTP11WebProxyClientProtocol(protocol.Protocol):
         parser.connectionLost(reason)
     
     def finished(self, rest):
-        #print "HTTP11WebProxyClientProtocol finished:",len(rest)
-        assert len(rest) == 0
+        if rest:
+            print "Spill-over data from the server:", len(rest)
+            self._buffer += rest
         self._disconnectParser(None)
 
 class WebProxyClientFactory(protocol.ClientFactory):
@@ -188,11 +288,10 @@ class WebProxyProtocol(HTTPParser):
         # Wikipedia does not accept absolute URIs:
         request.uri = self.convertUriToRelative(request.uri)
         request.persistent = True
-        proxyConn = self._serverParser.connHeaders.getRawHeaders('proxy-connection')
-        if proxyConn and proxyConn[0].lower() == 'close':
-            request.persistent = False
-        plainConn = self._serverParser.connHeaders.getRawHeaders('connection')
-        if plainConn and plainConn[0].lower() == 'close':
+        # Check if any of the Connection connHeaders is 'close'
+        connections = map(self._serverParser.connHeaders.getRawHeaders,
+                    ['proxy-connection','connection'])
+        if any([x.lower() == 'close' for y in connections if y for x in y]):
             request.persistent = False
         # HACK!!! Force close a connection if there is POST data because
         # I haven't implemented anything to check the length of the POST data
@@ -277,13 +376,13 @@ class MitmServerFactory(protocol.ServerFactory):
 def main():    
     parser = argparse.ArgumentParser(
                              description='Warc Man-in-the-Middle Twisted Proxy')
-    parser.add_argument('-p', '--port', default='8000',
+    parser.add_argument('-p', '--port', default='8080',
                         help='Port to run the proxy server on.')
     args = parser.parse_args()
     args.port = int(args.port)
 
-    print "Proxy running on port", args.port
     reactor.listenTCP(args.port, MitmServerFactory())
+    print "Proxy running on port", args.port
     reactor.run()
 
 if __name__=='__main__':
