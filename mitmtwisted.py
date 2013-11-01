@@ -106,29 +106,31 @@ class ProxyProtocol(protocol.Protocol):
     def __init__(self, forward):
         self.dataReceived = forward
 
-class WebProxyHTTPClientParser(HTTPClientParser):
+class ProxyHTTPClientParser(HTTPClientParser):
     _transferDecoders = {
         'chunked': _RawChunkedTransferDecoder, # Use our Raw decoder
     }
     serverProtocol = None
     
-    def _forwardData(self, data):
+    def forwardData(self, data):
         """ Takes raw data and forwards it right to the serverProtocol """
-        self.serverProtocol.transport.write(data)
+        raise NotImplementedError("Method must be overridden")
     
     def lineReceived(self, line):
         """ Forwards the headers exactly as they arrive """
         if line[-1:] == '\r':
             line = line[:-1]
-        self._forwardData(line + '\r\n') 
+        self.forwardData(line + '\r\n') 
         HTTPClientParser.lineReceived(self, line)
         
     def allHeadersReceived(self):
         HTTPClientParser.allHeadersReceived(self)
-        self.response.deliverBody(ProxyProtocol(self._forwardData))
+        self.response.deliverBody(ProxyProtocol(self.forwardData))
         
 class HTTP11WebProxyClientProtocol(protocol.Protocol):
     """ HTTP11 creates new parsers as they are needed over the HTTP1.1 stream"""
+    parser = ProxyHTTPClientParser
+    
     def __init__(self, serverProtocol):
         self.serverProtocol = serverProtocol
         self._buffer = ''
@@ -142,12 +144,15 @@ class HTTP11WebProxyClientProtocol(protocol.Protocol):
             self.serverProtocol.transport.loseConnection()
             self.serverProtocol = None
     
+    def dataFromClientParser(self, data):
+        self.serverProtocol.transport.write(data)
+    
     def newRequest(self, request):
         """
         Creates a new WebProxyHTTPClientParser parser with the given request
         """
-        self._parser = WebProxyHTTPClientParser(request, self.finished)
-        self._parser.serverProtocol = self.serverProtocol
+        self._parser = self.parser(request, self.finished)
+        self._parser.forwardData = self.dataFromClientParser
         self._parser.makeConnection(self.transport)
         if self._buffer:
             self._parser.dataReceived(self._buffer)
@@ -171,11 +176,13 @@ class HTTP11WebProxyClientProtocol(protocol.Protocol):
         self._disconnectParser(None)
 
 class WebProxyClientFactory(protocol.ClientFactory):
+    protocol = HTTP11WebProxyClientProtocol
+    
     def __init__(self, serverProtocol):
         self.serverProtocol = serverProtocol
 
     def buildProtocol(self, addr):
-        return HTTP11WebProxyClientProtocol(self.serverProtocol)
+        return self.protocol(self.serverProtocol)
 
     def clientConnectionFailed(self, connector, reason):
         if self.serverProtocol is not None:
@@ -231,6 +238,7 @@ class WebProxyProtocol(HTTPParser):
     """ Creates a web proxy for HTTP and HTTPS """
     certinfo = { 'key':'ca.key', 'cert':'ca.crt' }
     serverParser = HTTPServerParser
+    clientFactory = WebProxyClientFactory
     
     @staticmethod
     def convertUriToRelative(addr):
@@ -277,26 +285,25 @@ class WebProxyProtocol(HTTPParser):
             # _rawDataBuffer is relayed when _resume() is called
             self._rawDataBuffer += data
     
-    def writeToClientProtocol(self, data):
+    def dataFromServerParser(self, data):
         """ Called after self._serverParser receives rawData """
-        #print "WebProxyProtocol writeToClientProtocol:", len(data)
+        #print "WebProxyProtocol dataFromServerParser:", len(data)
         self.clientProtocol.transport.write(data)
         
     def requestParsed(self, request):
-        """ Called after self.httpServerPareser parses a Request """
+        """ Called after self._parser parses a Request """
         #print "  Request uri:",request.uri
         # Wikipedia does not accept absolute URIs:
         request.uri = self.convertUriToRelative(request.uri)
-        request.persistent = True
         # Check if any of the Connection connHeaders is 'close'
-        connections = map(self._serverParser.connHeaders.getRawHeaders,
+        conns = map(self._serverParser.connHeaders.getRawHeaders,
                     ['proxy-connection','connection'])
-        if any([x.lower() == 'close' for y in connections if y for x in y]):
-            request.persistent = False
-        # HACK!!! Force close a connection if there is POST data because
+        hasClose = any([x.lower() == 'close' for y in conns if y for x in y])
+        # HACK!!! Force close a connection if there is content-length because
         # I haven't implemented anything to check the length of the POST data
-        if self._serverParser.contentLength != 0:
-            request.persistent = False
+        request.persistent = \
+            False if hasClose or self._serverParser.contentLength != 0 \
+            else True
         self.clientProtocol.newRequest(request)
         request.writeTo(self.clientProtocol.transport)
     
@@ -305,7 +312,7 @@ class WebProxyProtocol(HTTPParser):
             self._serverParser.connectionLost(None)
             self._serverParser = None
         self._serverParser = self.serverParser(self.serverParserFinished)
-        self._serverParser.rawDataReceived = self.writeToClientProtocol
+        self._serverParser.rawDataReceived = self.dataFromServerParser
         self._serverParser.requestParsed = self.requestParsed
         self._serverParser.connectionMade() # initializes instance vars
         
@@ -327,7 +334,7 @@ class WebProxyProtocol(HTTPParser):
             host, port = self.parseHostPort(request_uri, 443)
             ccf = ssl.ClientContextFactory()
             print "New SSL:",host,port
-            reactor.connectSSL(host, port, WebProxyClientFactory(self), ccf)
+            reactor.connectSSL(host, port, self.clientFactory(self), ccf)
         else:
             if request_uri[:4].lower() == 'http':
                 uri = _URI.fromBytes(request_uri)
@@ -336,7 +343,7 @@ class WebProxyProtocol(HTTPParser):
                 # the status line
                 raise ParseError('Status line did not contain an absolute uri!')
             print "New HTTP:",uri.host,uri.port
-            reactor.connectTCP(uri.host, uri.port, WebProxyClientFactory(self))
+            reactor.connectTCP(uri.host, uri.port, self.clientFactory(self))
         HTTPParser.allHeadersReceived(self) # self.switchToBodyMode(None)
         
     def _resume(self, clientProtocol):
@@ -375,7 +382,7 @@ class MitmServerFactory(protocol.ServerFactory):
 
 def main():    
     parser = argparse.ArgumentParser(
-                             description='Warc Man-in-the-Middle Twisted Proxy')
+                             description='Man-in-the-Middle Twisted Proxy')
     parser.add_argument('-p', '--port', default='8080',
                         help='Port to run the proxy server on.')
     args = parser.parse_args()
