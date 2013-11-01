@@ -1,3 +1,4 @@
 *.pyc
 *.warc.gz
 *.warc
+*.idx

@@ -1,5 +1,4 @@
-# Copyright (C) David Bern
-# See COPYRIGHT.md for details
+# Copyright (c) David Bern
 
 
 """
