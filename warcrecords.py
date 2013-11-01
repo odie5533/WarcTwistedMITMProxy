@@ -28,7 +28,7 @@ Singleton that handles maintaining a single output file for many connections
 class WarcOutputSingleton(object):
     _instance = None
 
-    def __new__(cls, * args, **kwargs):
+    def __new__(cls, *args, **kwargs):
         if not cls._instance:
             cls._instance = super(WarcOutputSingleton, cls).__new__(cls, *args, **kwargs)
         return cls._instance
@@ -37,7 +37,7 @@ class WarcOutputSingleton(object):
         if filename is None:
             filename = "out.warc.gz"
             print "WarcOutput was not given a filename. Using", filename
-        self.use_gzip = True if args.file.endswith('.gz') else False
+        self.use_gzip = True if filename.endswith('.gz') else False
         self.filename = filename
 
         # Make sure init is not called more than once
@@ -45,7 +45,7 @@ class WarcOutputSingleton(object):
             self.__fo
         except AttributeError:
             self.__fo = open(self.filename, 'wb')
-            record = warcrecords.WarcinfoRecord()
+            record = WarcinfoRecord()
             record.write_to(self.__fo, gzip=self.use_gzip)
 
     # Write a given record to the output file

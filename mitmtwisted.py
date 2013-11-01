@@ -1,5 +1,6 @@
 # Copyright (c) David Bern
 
+
 # TOFIX: Handle Request bodies properly
 
 import argparse
@@ -131,9 +132,10 @@ class HTTP11WebProxyClientProtocol(protocol.Protocol):
     """ HTTP11 creates new parsers as they are needed over the HTTP1.1 stream"""
     parser = ProxyHTTPClientParser
     
-    def __init__(self, serverProtocol):
+    def __init__(self, serverProtocol, con_uri):
         self.serverProtocol = serverProtocol
         self._buffer = ''
+        self.connect_uri = con_uri
         
     def connectionMade(self):
         self.serverProtocol._resume(self)
@@ -151,6 +153,7 @@ class HTTP11WebProxyClientProtocol(protocol.Protocol):
         """
         Creates a new WebProxyHTTPClientParser parser with the given request
         """
+        self.request = request
         self._parser = self.parser(request, self.finished)
         self._parser.forwardData = self.dataFromClientParser
         self._parser.makeConnection(self.transport)
@@ -178,11 +181,12 @@ class HTTP11WebProxyClientProtocol(protocol.Protocol):
 class WebProxyClientFactory(protocol.ClientFactory):
     protocol = HTTP11WebProxyClientProtocol
     
-    def __init__(self, serverProtocol):
+    def __init__(self, serverProtocol, con_uri):
         self.serverProtocol = serverProtocol
+        self.con_uri = con_uri
 
-    def buildProtocol(self, addr):
-        return self.protocol(self.serverProtocol)
+    def buildProtocol(self, _):
+        return self.protocol(self.serverProtocol, self.con_uri)
 
     def clientConnectionFailed(self, connector, reason):
         if self.serverProtocol is not None:
@@ -241,9 +245,9 @@ class WebProxyProtocol(HTTPParser):
     clientFactory = WebProxyClientFactory
     
     @staticmethod
-    def convertUriToRelative(addr):
+    def convertUriToRelative(uri):
         """ Converts an absolute URI to a relative one """
-        parsedURI = _URI.fromBytes(addr)
+        parsedURI = _URI.fromBytes(uri)
         parsedURI.scheme = parsedURI.netloc = None
         return parsedURI.toBytes()
     
@@ -330,22 +334,22 @@ class WebProxyProtocol(HTTPParser):
         method, request_uri, _ = self.parseHttpStatus(self.status)
         
         self.useSSL = method == 'CONNECT'
+        connect = reactor.connectTCP
         if self.useSSL:
-            host, port = self.parseHostPort(request_uri, 443)
-            ccf = ssl.ClientContextFactory()
-            print "New SSL:",host,port
-            reactor.connectSSL(host, port, self.clientFactory(self), ccf)
-        else:
-            if request_uri[:4].lower() == 'http':
-                uri = _URI.fromBytes(request_uri)
-            else:
-                # TOFIX: Should check for host in the headers and not just
-                # the status line
-                raise ParseError('Status line did not contain an absolute uri!')
-            print "New HTTP:",uri.host,uri.port
-            reactor.connectTCP(uri.host, uri.port, self.clientFactory(self))
-        HTTPParser.allHeadersReceived(self) # self.switchToBodyMode(None)
+            request_uri = 'https://' + request_uri
+            connect = lambda h,f,p: reactor.connectSSL(h, f, p,
+                                                     ssl.ClientContextFactory())
+        if request_uri[:4].lower() != 'http':
+            # TOFIX: Should check for host in the headers and not just
+            # the status line
+            raise ParseError("HTTP status line did not have an absolute uri")
         
+        parsedUri = _URI.fromBytes(request_uri)
+        print "New connection to:", parsedUri.host, parsedUri.port
+        connect(parsedUri.host, parsedUri.port,
+                self.clientFactory(self, parsedUri.toBytes()))
+        HTTPParser.allHeadersReceived(self) # self.switchToBodyMode(None)
+    
     def _resume(self, clientProtocol):
         """
         Called when a connection to the remote server is established.
@@ -357,8 +361,9 @@ class WebProxyProtocol(HTTPParser):
         self.createHttpServerParser()
         
         if not self.useSSL:
-            # The outer header data for the SSL connection should not be parsed
-            # These inject our already parsed data into the new _serverParser
+            # Outer header data for the SSL connection should not be parsed
+            # Since this is plain HTTP, these inject our already parsed data
+            # into the new _serverParser
             self._serverParser.status = self.status
             self._serverParser.headers = self.headers
             self._serverParser.connHeaders = self.connHeaders
@@ -369,12 +374,12 @@ class WebProxyProtocol(HTTPParser):
             self._serverParser.dataReceived(self._rawDataBuffer)
             self._rawDataBuffer = ''
         
-        self.transport.resumeProducing()
         if self.useSSL:
             self.transport.write('HTTP/1.0 200 Connection established\r\n\r\n')
             ctx = ssl.DefaultOpenSSLContextFactory(
                                     self.certinfo['key'], self.certinfo['cert'])
             self.transport.startTLS(ctx)
+        self.transport.resumeProducing()
         
 
 class MitmServerFactory(protocol.ServerFactory):
@@ -382,7 +387,7 @@ class MitmServerFactory(protocol.ServerFactory):
 
 def main():    
     parser = argparse.ArgumentParser(
-                             description='Man-in-the-Middle Twisted Proxy')
+                             description='Twisted Man-in-the-Middle Proxy')
     parser.add_argument('-p', '--port', default='8080',
                         help='Port to run the proxy server on.')
     args = parser.parse_args()
@@ -394,5 +399,3 @@ def main():
 
 if __name__=='__main__':
     main()
-    #import autoreload
-    #autoreload.main(main)
